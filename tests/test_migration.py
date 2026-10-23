@@ -8,10 +8,10 @@ All tests are fully offline:
   row-level assertions use in-memory SQLite fixtures.
 
 Coverage:
-  MigrationScriptTests  – DDL correctness, FK order, sequence reset, rollback on failure
-  VerificationScriptTests – count pass/fail paths, FK-check pass/fail, sequence check
-  CredentialSafetyTests – URL never appears in any output or exception message
-  EnvLoadingTests       – .env loading, missing key handling
+  MigrationScriptTests - DDL correctness, FK order, sequence reset, rollback on failure
+  VerificationScriptTests - count pass/fail paths, FK-check pass/fail, sequence check
+  CredentialSafetyTests - URL never appears in any output or exception message
+  EnvLoadingTests - .env loading, missing key handling
 """
 
 import os
@@ -81,7 +81,7 @@ def _make_pg_mock(row_counts: dict[str, int] | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 1. Migration Script – Structural Tests (no DB contact)
+# 1. Migration Script - Structural Tests (no DB contact)
 # ---------------------------------------------------------------------------
 
 class MigrationDDLTests(unittest.TestCase):
@@ -173,7 +173,7 @@ class MigrationDDLTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. Migration Script – Runtime / DB-Mock Tests
+# 2. Migration Script - Runtime / DB-Mock Tests
 # ---------------------------------------------------------------------------
 
 class MigrationRuntimeTests(unittest.TestCase):
@@ -184,10 +184,50 @@ class MigrationRuntimeTests(unittest.TestCase):
         mem.row_factory = sqlite3.Row
         mem.execute("CREATE TABLE Categories (CategoryID INTEGER PRIMARY KEY, CategoryName TEXT, Description TEXT)")
         mem.execute("INSERT INTO Categories VALUES (1, 'Beverages', 'Drinks')")
-        # … additional tables omitted for brevity; we patch fetch too
+        # ... additional tables omitted for brevity; we patch fetch too
         return mem
 
    
+    @patch("scripts.migrate_to_postgres.load_env_file")
+    @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
+    @patch("scripts.migrate_to_postgres.open_sqlite_readonly")
+    @patch("psycopg2.connect")
+    def test_connection_failure_closes_sqlite(
+        self, mock_connect, mock_sqlite_open, mock_url, mock_env
+    ):
+        """SQLite must close if the initial PostgreSQL connection fails."""
+        sqlite_conn = MagicMock()
+        mock_sqlite_open.return_value = sqlite_conn
+        mock_connect.side_effect = RuntimeError("simulated connection failure")
+
+        with self.assertRaises(SystemExit) as exc:
+            run_migration(dry_run=False, overwrite=True)
+
+        self.assertEqual(exc.exception.code, 1)
+        sqlite_conn.close.assert_called_once()
+
+    @patch("scripts.migrate_to_postgres.load_env_file")
+    @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
+    @patch("scripts.migrate_to_postgres.open_sqlite_readonly")
+    @patch("psycopg2.connect")
+    def test_cursor_failure_closes_connections(
+        self, mock_connect, mock_sqlite_open, mock_url, mock_env
+    ):
+        """Both connections must close if PostgreSQL cursor creation fails."""
+        sqlite_conn = MagicMock()
+        pg_conn = MagicMock()
+        pg_conn.cursor.side_effect = RuntimeError("simulated cursor failure")
+        mock_sqlite_open.return_value = sqlite_conn
+        mock_connect.return_value = pg_conn
+
+        with self.assertRaises(SystemExit) as exc:
+            run_migration(dry_run=False, overwrite=True)
+
+        self.assertEqual(exc.exception.code, 1)
+        sqlite_conn.close.assert_called_once()
+        pg_conn.close.assert_called_once()
+        pg_conn.rollback.assert_called_once()
+
     @patch("scripts.migrate_to_postgres.load_env_file")
     @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
     @patch("scripts.migrate_to_postgres.open_sqlite_readonly")

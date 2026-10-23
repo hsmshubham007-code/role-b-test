@@ -286,13 +286,15 @@ def run_migration(dry_run: bool = False, overwrite: bool = False) -> None:
     print("Opening SQLite database (read-only)...")
     sqlite_conn = open_sqlite_readonly(sqlite_path)
 
-    print("Connecting to Neon PostgreSQL...")
-    # Connection string is never printed
-    pg_conn = psycopg2.connect(neon_url)
-    pg_conn.autocommit = False  # explicit transaction
-    pg_cur = pg_conn.cursor()
+    pg_conn = None
+    pg_cur = None
 
     try:
+        print("Connecting to Neon PostgreSQL...")
+        # Connection string is never printed
+        pg_conn = psycopg2.connect(neon_url)
+        pg_conn.autocommit = False  # explicit transaction
+        pg_cur = pg_conn.cursor()
         # ----------------------------------------------------------------
         # Step 1: Drop existing tables in reverse FK order (idempotent)
         # ----------------------------------------------------------------
@@ -372,7 +374,8 @@ def run_migration(dry_run: bool = False, overwrite: bool = False) -> None:
         print(f"  Total rows migrated: {sum(EXPECTED_COUNTS.values())}")
 
     except Exception as exc:
-        pg_conn.rollback()
+        if pg_conn is not None:
+            pg_conn.rollback()
         print(f"\n[FAIL] Migration FAILED - transaction rolled back.", file=sys.stderr)
         # Print the error class and message but never the connection string
         print(f"  Error: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -380,9 +383,10 @@ def run_migration(dry_run: bool = False, overwrite: bool = False) -> None:
 
     finally:
         sqlite_conn.close()
-        pg_cur.close()
-        pg_conn.close()
-
+        if pg_cur is not None:
+            pg_cur.close()
+        if pg_conn is not None:
+            pg_conn.close()
 
 # ---------------------------------------------------------------------------
 # Entry point
