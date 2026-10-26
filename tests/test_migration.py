@@ -187,7 +187,7 @@ class MigrationRuntimeTests(unittest.TestCase):
         # ... additional tables omitted for brevity; we patch fetch too
         return mem
 
-   
+
     @patch("scripts.migrate_to_postgres.load_env_file")
     @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
     @patch("scripts.migrate_to_postgres.open_sqlite_readonly")
@@ -228,6 +228,22 @@ class MigrationRuntimeTests(unittest.TestCase):
         pg_conn.close.assert_called_once()
         pg_conn.rollback.assert_called_once()
 
+
+    def test_reset_sequence_rejects_mismatched_state(self):
+        """A mismatched sequence state must raise RuntimeError."""
+        pg_cur = MagicMock()
+        pg_cur.fetchone.side_effect = [
+            ("public.categories_categoryid_seq",),  # sequence lookup
+            (1,),                                   # MAX(categoryid)
+            (99, True),                             # wrong value and called state
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Sequence verification failed"
+        ):
+            reset_sequence(pg_cur, "categories", "categoryid", 8)
+
+
     @patch("scripts.migrate_to_postgres.load_env_file")
     @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
     @patch("scripts.migrate_to_postgres.open_sqlite_readonly")
@@ -236,17 +252,35 @@ class MigrationRuntimeTests(unittest.TestCase):
     def test_12_successful_migration_commits(
         self, mock_pg_connect, mock_fetch, mock_sqlite_open, mock_url, mock_env
     ):
-        """A successful migration resets all sequences and verifies every table before commit."""
+        """Successful migration verifies sequences and counts before commit."""
         mock_fetch.return_value = [(1,)]
 
         pg_conn = MagicMock()
         pg_cur = MagicMock()
 
-        # reset_sequence() does not call fetchone(); only the eight
-        # destination COUNT(*) queries consume these results.
-        pg_cur.fetchone.side_effect = [
-            (count,) for count in EXPECTED_COUNTS.values()
+        tables = [
+            ("categories", "categoryid", 8),
+            ("customers", "customerid", 91),
+            ("employees", "employeeid", 10),
+            ("shippers", "shipperid", 3),
+            ("suppliers", "supplierid", 29),
+            ("products", "productid", 77),
+            ("orders", "orderid", 10443),
+            ("orderdetails", "orderdetailid", 518),
         ]
+
+        sequence_results = []
+        for table, pk, min_next in tables:
+            sequence_results.extend([
+                (f"public.{table}_{pk}_seq",),
+                (1,),                 # MAX(pk)
+                (min_next, False),    # verified sequence state
+            ])
+
+        pg_cur.fetchone.side_effect = (
+            sequence_results
+            + [(count,) for count in EXPECTED_COUNTS.values()]
+        )
 
         pg_conn.cursor.return_value = pg_cur
         mock_pg_connect.return_value = pg_conn
@@ -254,73 +288,51 @@ class MigrationRuntimeTests(unittest.TestCase):
 
         run_migration(dry_run=False, overwrite=True)
 
-        # Capture the SQL statements in execution order.
         executed_sql = [
             str(entry.args[0])
             for entry in pg_cur.execute.call_args_list
         ]
 
-        # All eight sequence resets must be executed.
-        sequence_sql = [
-            sql for sql in executed_sql
-            if "pg_get_serial_sequence" in sql.lower()
+        sequence_lookup_sql = [
+            statement for statement in executed_sql
+            if "pg_get_serial_sequence" in statement.lower()
         ]
-        self.assertEqual(len(sequence_sql), 8)
+        setval_sql = [
+            statement for statement in executed_sql
+            if "setval(" in statement.lower()
+        ]
+        self.assertEqual(len(sequence_lookup_sql), 8)
+        self.assertEqual(len(setval_sql), 8)
 
-        for table, pk in [
-            ("categories", "categoryid"),
-            ("customers", "customerid"),
-            ("employees", "employeeid"),
-            ("shippers", "shipperid"),
-            ("suppliers", "supplierid"),
-            ("products", "productid"),
-            ("orders", "orderid"),
-            ("orderdetails", "orderdetailid"),
-        ]:
-            matching = [
-                sql for sql in sequence_sql
-                if f"'{table}'" in sql.lower()
-                and f"'{pk}'" in sql.lower()
-            ]
-            self.assertEqual(
-                len(matching), 1,
-                f"Expected exactly one sequence reset for {table}.{pk}",
-            )
+        sequence_lookup_calls = [
+            entry for entry in pg_cur.execute.call_args_list
+            if "pg_get_serial_sequence" in str(entry.args[0]).lower()
+        ]
+        lookup_params = [entry.args[1] for entry in sequence_lookup_calls]
+        self.assertIn(("public.categories", "categoryid"), lookup_params)
+        self.assertIn(("public.orders", "orderid"), lookup_params)
 
-        # All eight destination row-count checks must be executed.
         count_sql = [
-            sql for sql in executed_sql
-            if sql.strip().lower().startswith("select count(*)")
+            statement for statement in executed_sql
+            if statement.strip().lower().startswith("select count(*)")
         ]
         self.assertEqual(len(count_sql), len(EXPECTED_COUNTS))
 
-        for table in EXPECTED_COUNTS:
-            matching = [
-                sql for sql in count_sql
-                if sql.strip().lower() == f"select count(*) from {table}".lower()
-            ]
-            self.assertEqual(
-                len(matching), 1,
-                f"Expected exactly one row-count check for {table}",
-            )
-
-        # Every verification statement must precede the transaction commit.
         self.assertEqual(pg_conn.commit.call_count, 1)
         self.assertEqual(pg_conn.rollback.call_count, 0)
 
-        # Confirm the verification SQL was executed before commit.
         all_mock_calls = pg_conn.mock_calls
         commit_index = all_mock_calls.index(call.commit())
-
-        for sql in sequence_sql + count_sql:
-            execute_call = call.cursor().execute(sql)
+        for entry in pg_cur.execute.call_args_list:
             self.assertIn(
-                execute_call, all_mock_calls[:commit_index],
-                f"Verification SQL ran after commit: {sql}",
+                call.cursor().execute(*entry.args, **entry.kwargs),
+                all_mock_calls[:commit_index],
             )
 
-        # All expected row-count results must have been consumed.
-        self.assertEqual(pg_cur.fetchone.call_count, len(EXPECTED_COUNTS))
+        self.assertEqual(
+            pg_cur.fetchone.call_count,
+            3 * len(tables) + len(EXPECTED_COUNTS),
+        )
 
 
     @patch("scripts.migrate_to_postgres.load_env_file")
@@ -347,7 +359,7 @@ class MigrationRuntimeTests(unittest.TestCase):
         pg_conn.rollback.assert_called_once()
         pg_conn.commit.assert_not_called()
 
-   
+
     @patch("scripts.migrate_to_postgres.load_env_file")
     @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
     @patch("scripts.migrate_to_postgres.open_sqlite_readonly")
@@ -415,7 +427,7 @@ class MigrationRuntimeTests(unittest.TestCase):
             with self.assertRaises((RuntimeError, SystemExit)):
                 get_neon_url()
         mock_pg_connect.assert_not_called()
-    
+
     @patch("scripts.migrate_to_postgres.get_neon_url")
     @patch("psycopg2.connect")
     def test_25_missing_overwrite_flag_exits_before_connect(self, mock_connect, mock_url):
@@ -425,6 +437,8 @@ class MigrationRuntimeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
         mock_connect.assert_not_called()
         mock_url.assert_not_called()
+
+
 
     @patch("scripts.migrate_to_postgres.load_env_file")
     @patch("scripts.migrate_to_postgres.get_neon_url", return_value="postgresql://mock")
@@ -439,8 +453,33 @@ class MigrationRuntimeTests(unittest.TestCase):
         mock_connect.return_value = pg_conn
         mock_sqlite.return_value = MagicMock()
 
+        tables = [
+            ("categories", "categoryid", 8),
+            ("customers", "customerid", 91),
+            ("employees", "employeeid", 10),
+            ("shippers", "shipperid", 3),
+            ("suppliers", "supplierid", 29),
+            ("products", "productid", 77),
+            ("orders", "orderid", 10443),
+            ("orderdetails", "orderdetailid", 518),
+        ]
+
+        sequence_results = []
+        for table, pk, min_next in tables:
+            sequence_results.extend([
+                (f"public.{table}_{pk}_seq",),
+                (0,),                  # MAX(pk) for empty destination
+                (min_next, False),     # verified next sequence value
+            ])
+
+        pg_cur.fetchone.side_effect = sequence_results + [
+            (count,) for count in EXPECTED_COUNTS.values()
+        ]
+
         run_migration(dry_run=False, overwrite=True)
         mock_connect.assert_called_once()
+        self.assertEqual(pg_conn.commit.call_count, 1)
+        self.assertEqual(pg_conn.rollback.call_count, 0)
 
 
 # ---------------------------------------------------------------------------

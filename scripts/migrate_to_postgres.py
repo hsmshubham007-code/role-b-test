@@ -225,18 +225,72 @@ def build_insert_sql(pg_table: str, columns: list[str]) -> str:
     return f"INSERT INTO {pg_table} ({col_list}) VALUES ({placeholders})"
 
 
-def reset_sequence(pg_cursor, pg_table: str, pk_col: str) -> None:
-    """
-    Set the identity sequence to MAX(pk_col) so future INSERTs
-    do not collide with explicitly inserted IDs.
-    Uses MAX() — safe even for non-contiguous IDs (e.g. Orders starting at 10248).
-    """
+def reset_sequence(
+    pg_cursor,
+    pg_table: str,
+    pk_col: str,
+    min_next: int,
+) -> None:
+    """Reset and verify a sequence's next generated ID."""
+    from psycopg2 import sql
+
+    # Resolve the sequence attached to the primary-key column.
     pg_cursor.execute(
-        f"SELECT SETVAL(pg_get_serial_sequence('{pg_table}', '{pk_col}'), "
-        f"COALESCE(MAX({pk_col}), 1)) FROM {pg_table}"
+        "SELECT pg_get_serial_sequence(%s, %s)",
+        (f"public.{pg_table}", pk_col),
+    )
+    result = pg_cursor.fetchone()
+
+    if not result or not result[0]:
+        raise RuntimeError(
+            f"No sequence is attached to public.{pg_table}.{pk_col}"
+        )
+
+    sequence_name = result[0]
+
+    # Find the maximum existing primary key.
+    pg_cursor.execute(
+        sql.SQL("SELECT COALESCE(MAX({}), 0) FROM {}").format(
+            sql.Identifier(pk_col),
+            sql.Identifier("public", pg_table),
+        )
+    )
+    result = pg_cursor.fetchone()
+
+    if not result or result[0] is None:
+        raise RuntimeError(
+            f"Could not determine maximum PK for public.{pg_table}"
+        )
+
+    max_pk = result[0]
+    next_value = max(max_pk + 1, min_next, 1)
+
+    # Set the sequence so its next nextval() returns next_value.
+    pg_cursor.execute(
+        "SELECT setval(%s::regclass, %s, false)",
+        (sequence_name, next_value),
     )
 
+    # Read back the sequence state using a safely quoted identifier.
+    sequence_parts = sequence_name.split(".")
+    if len(sequence_parts) != 2:
+        raise RuntimeError(
+            f"Unexpected sequence name for public.{pg_table}.{pk_col}"
+        )
 
+    pg_cursor.execute(
+        sql.SQL("SELECT last_value, is_called FROM {}").format(
+            sql.Identifier(*sequence_parts)
+        )
+    )
+    state = pg_cursor.fetchone()
+
+    if not state or state[0] != next_value or state[1] is not False:
+        raise RuntimeError(
+            f"Sequence verification failed for public.{pg_table}.{pk_col}: "
+            f"expected next value {next_value} with is_called=False; "
+            f"got {state!r}"
+        )
 # ---------------------------------------------------------------------------
 # Core migration
 # ---------------------------------------------------------------------------
@@ -337,17 +391,18 @@ def run_migration(dry_run: bool = False, overwrite: bool = False) -> None:
         # ----------------------------------------------------------------
         print("\n[4/5] Resetting identity sequences...")
         pk_map = {
-            "categories":   "categoryid",
-            "customers":    "customerid",
-            "employees":    "employeeid",
-            "shippers":     "shipperid",
-            "suppliers":    "supplierid",
-            "products":     "productid",
-            "orders":       "orderid",
-            "orderdetails": "orderdetailid",
+            "categories":   ("categoryid", 8),
+            "customers":   ("customerid", 91),
+            "employees":   ("employeeid", 10),
+            "shippers":    ("shipperid", 3),
+            "suppliers":   ("supplierid", 29),
+            "products":    ("productid", 77),
+            "orders":      ("orderid", 10443),
+            "orderdetails": ("orderdetailid", 518),
         }
-        for tbl, pk in pk_map.items():
-            reset_sequence(pg_cur, tbl, pk)
+
+        for tbl, (pk, min_next) in pk_map.items():
+            reset_sequence(pg_cur, tbl, pk, min_next)
             print(f"      Sequence reset: {tbl}.{pk}")
 
         # ----------------------------------------------------------------
